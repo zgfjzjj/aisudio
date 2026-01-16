@@ -14,6 +14,7 @@ export interface Shot {
   cameraParams: CameraParams;
   seed: number; // 用于锁定画面内容
   isGrid?: boolean; // 新增：标记是否为9宫格方案图
+  model: string; // 新增：使用的模型版本
 }
 
 export interface CameraParams {
@@ -41,4 +42,10 @@ export interface BrushSettings {
   color: string;
   size: number;
   isEnabled: boolean;
+}
+
+export interface UsageMetadata {
+  promptTokenCount: number;
+  candidatesTokenCount: number;
+  totalTokenCount: number;
 }

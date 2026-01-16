@@ -1,5 +1,6 @@
 
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
+import { UsageMetadata } from "../types";
 
 const getAiClient = () => {
   const apiKey = process.env.API_KEY;
@@ -9,24 +10,69 @@ const getAiClient = () => {
   return new GoogleGenAI({ apiKey });
 };
 
+// Retry helper with exponential backoff and jitter
+const retryOperation = async <T>(
+  operation: () => Promise<T>, 
+  maxRetries = 5, 
+  initialDelay = 2000
+): Promise<T> => {
+  let lastError: any;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (error: any) {
+      lastError = error;
+      
+      // Analyze error structure
+      // The API might return { error: { code: 429, ... } } or throw a standard Error
+      const errBody = error?.error || error; 
+      const code = errBody?.code || error?.status;
+      const message = errBody?.message || error?.message || "";
+      const status = errBody?.status;
+      const errStr = JSON.stringify(error);
+
+      const isRateLimit = 
+        code === 429 || 
+        status === "RESOURCE_EXHAUSTED" ||
+        (message && (
+          message.includes('429') || 
+          message.includes('RESOURCE_EXHAUSTED') ||
+          message.includes('quota') ||
+          message.includes('exceeded')
+        )) ||
+        errStr.includes('RESOURCE_EXHAUSTED');
+      
+      const isServerOverload = code === 503 || (message && message.includes('503'));
+
+      if ((isRateLimit || isServerOverload) && i < maxRetries - 1) {
+        // Exponential backoff + Random jitter (0-1000ms)
+        const jitter = Math.floor(Math.random() * 1000);
+        const delay = initialDelay * Math.pow(2, i) + jitter;
+        
+        console.warn(`[Gemini Service] Rate limit/Overload hit (${code || status}). Retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
+        
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      
+      // If not retriable or retries exhausted, rethrow
+      throw error;
+    }
+  }
+  throw lastError;
+};
+
 // 辅助函数：本地裁剪图片
-// 解决 AI 提取分镜时容易受原图网格影响再次生成网格的问题
 const cropImage = (base64: string, index: number): Promise<string> => {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    // 处理可能的跨域问题（如果是 dataURL 其实不需要，但以防万一）
     img.crossOrigin = "anonymous";
     img.onload = () => {
       try {
-        // 假设是 3x3 网格
         const cols = 3;
         const rows = 3;
-        
-        // 计算单个单元格的尺寸
         const cellWidth = img.width / cols;
         const cellHeight = img.height / rows;
-        
-        // 计算目标单元格的坐标 (index 是 1-9)
         const i = index - 1;
         const col = i % cols;
         const row = Math.floor(i / cols);
@@ -41,11 +87,10 @@ const cropImage = (base64: string, index: number): Promise<string> => {
            return;
         }
         
-        // 裁剪绘制
         ctx.drawImage(
           img, 
-          col * cellWidth, row * cellHeight, cellWidth, cellHeight, // 源区域
-          0, 0, cellWidth, cellHeight // 目标区域
+          col * cellWidth, row * cellHeight, cellWidth, cellHeight, 
+          0, 0, cellWidth, cellHeight 
         );
         
         resolve(canvas.toDataURL('image/png'));
@@ -58,8 +103,12 @@ const cropImage = (base64: string, index: number): Promise<string> => {
   });
 };
 
-const handleImageResponse = (response: any) => {
+const emptyUsage: UsageMetadata = { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 };
+
+const handleImageResponse = (response: any): { base64: string, usage: UsageMetadata } => {
   const candidates = response.candidates;
+  const usage = response.usageMetadata || emptyUsage;
+
   if (!candidates || candidates.length === 0) {
     throw new Error("No candidates in response");
   }
@@ -74,7 +123,10 @@ const handleImageResponse = (response: any) => {
     let textContent = "";
     for (const part of candidate.content.parts) {
       if (part.inlineData) {
-        return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+        return {
+          base64: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`,
+          usage
+        };
       }
       if (part.text) {
           textContent += part.text;
@@ -89,7 +141,7 @@ const handleImageResponse = (response: any) => {
   throw new Error("No image data found in response");
 };
 
-export const polishScript = async (script: string): Promise<string> => {
+export const polishScript = async (script: string): Promise<{ text: string, usage: UsageMetadata }> => {
   const ai = getAiClient();
   const prompt = `
     你是一位专业的电影分镜脚本师。请将以下简略的分镜描述扩写为一段画面感极强、包含环境细节、光影氛围和人物情绪的专业分镜描述。
@@ -103,18 +155,21 @@ export const polishScript = async (script: string): Promise<string> => {
   `;
 
   try {
-    const response = await ai.models.generateContent({
+    const response: GenerateContentResponse = await retryOperation(() => ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: prompt,
-    });
-    return response.text || "";
+    }));
+    return {
+      text: response.text || "",
+      usage: response.usageMetadata || emptyUsage
+    };
   } catch (error) {
     console.error("Error polishing script:", error);
     throw error;
   }
 };
 
-export const generatePrompts = async (enhancedScript: string): Promise<{ en: string; cn: string }> => {
+export const generatePrompts = async (enhancedScript: string): Promise<{ en: string, cn: string, usage: UsageMetadata }> => {
   const ai = getAiClient();
   const prompt = `
     Based on the following storyboard description, generate a high-quality AI image generation prompt (Stable Diffusion/Midjourney style) in English, and provide a direct Simplified Chinese translation of the prompt.
@@ -129,7 +184,7 @@ export const generatePrompts = async (enhancedScript: string): Promise<{ en: str
   `;
 
   try {
-    const response = await ai.models.generateContent({
+    const response: GenerateContentResponse = await retryOperation(() => ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: prompt,
       config: {
@@ -143,7 +198,7 @@ export const generatePrompts = async (enhancedScript: string): Promise<{ en: str
           required: ["en_prompt", "cn_explanation"]
         }
       }
-    });
+    }));
 
     const jsonText = response.text;
     if (!jsonText) throw new Error("No response from AI");
@@ -152,9 +207,32 @@ export const generatePrompts = async (enhancedScript: string): Promise<{ en: str
     return {
       en: result.en_prompt,
       cn: result.cn_explanation,
+      usage: response.usageMetadata || emptyUsage
     };
   } catch (error) {
     console.error("Error generating prompts:", error);
+    throw error;
+  }
+};
+
+export const translateText = async (text: string): Promise<{ text: string, usage: UsageMetadata }> => {
+  const ai = getAiClient();
+  const prompt = `Translate the following English AI image prompt into Simplified Chinese. Just provide the direct translation.
+  
+  English: ${text}
+  Chinese:`;
+
+  try {
+    const response: GenerateContentResponse = await retryOperation(() => ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: prompt,
+    }));
+    return {
+      text: response.text?.trim() || "",
+      usage: response.usageMetadata || emptyUsage
+    };
+  } catch (error) {
+    console.error("Error translating text:", error);
     throw error;
   }
 };
@@ -164,8 +242,9 @@ export const generateImage = async (
   aspectRatio: string,
   referenceImages: string[],
   seed?: number,
-  isGrid: boolean = false
-): Promise<string> => {
+  isGrid: boolean = false,
+  model: string = 'gemini-2.5-flash-image'
+): Promise<{ base64: string, usage: UsageMetadata }> => {
   const ai = getAiClient();
   const parts: any[] = [];
   
@@ -182,7 +261,6 @@ export const generateImage = async (
   let fullPrompt = prompt;
   
   if (isGrid) {
-    // 修复 Bug 1: 强化 3x3 网格结构描述，防止生成 4 行
     fullPrompt = `Create a strict 3x3 grid storyboard contact sheet.
     Structure: Exactly 3 rows and 3 columns.
     Content: Exactly 9 distinct panels numbered 1 to 9.
@@ -199,8 +277,9 @@ export const generateImage = async (
   parts.push({ text: fullPrompt });
 
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-image', 
+    console.log(`Generating image using model: ${model}`);
+    const response = await retryOperation(() => ai.models.generateContent({
+      model: model, 
       contents: { parts },
       config: {
         seed: seed,
@@ -208,7 +287,7 @@ export const generateImage = async (
           aspectRatio: aspectRatio as any
         }
       }
-    });
+    }));
 
     return handleImageResponse(response);
   } catch (error) {
@@ -221,15 +300,13 @@ export const extractGridPanel = async (
   gridImageBase64: string,
   panelIndex: number,
   originalPrompt: string,
-  aspectRatio: string
-): Promise<string> => {
+  aspectRatio: string,
+  model: string = 'gemini-2.5-flash-image'
+): Promise<{ base64: string, usage: UsageMetadata }> => {
   const ai = getAiClient();
   
   try {
-    // 修复 Bug 2: 核心修改 - 在本地先裁剪出单张小图，再发给 AI
-    // 这样 AI 只能看到单张图，就不可能再画出网格了
     const croppedBase64 = await cropImage(gridImageBase64, panelIndex);
-    
     const parts: any[] = [];
     const data = croppedBase64.split(',')[1] || croppedBase64;
     
@@ -240,7 +317,6 @@ export const extractGridPanel = async (
       }
     });
 
-    // 提示词改为“高清重绘”，而不是“提取”
     const fullPrompt = `The provided image is a low-resolution storyboard draft.
     Your task is to RE-GENERATE this exact scene in high-resolution (8k, photorealistic).
     
@@ -254,15 +330,15 @@ export const extractGridPanel = async (
 
     parts.push({ text: fullPrompt });
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-image',
+    const response = await retryOperation(() => ai.models.generateContent({
+      model: model,
       contents: { parts },
       config: {
         imageConfig: {
           aspectRatio: aspectRatio as any
         }
       }
-    });
+    }));
 
     return handleImageResponse(response);
   } catch (error) {
@@ -273,8 +349,9 @@ export const extractGridPanel = async (
 
 export const editImage = async (
   baseImage: string,
-  prompt: string
-): Promise<string> => {
+  prompt: string,
+  model: string = 'gemini-2.5-flash-image'
+): Promise<{ base64: string, usage: UsageMetadata }> => {
   const ai = getAiClient();
   const parts: any[] = [];
   const data = baseImage.split(',')[1] || baseImage;
@@ -289,10 +366,10 @@ export const editImage = async (
   parts.push({ text: `Modify this image: ${prompt}. Maintain continuity.` });
 
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-image',
+    const response = await retryOperation(() => ai.models.generateContent({
+      model: model,
       contents: { parts },
-    });
+    }));
 
     return handleImageResponse(response);
   } catch (error) {

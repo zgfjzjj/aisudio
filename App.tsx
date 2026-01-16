@@ -3,9 +3,11 @@ import React, { useState } from 'react';
 import Sidebar from './components/Sidebar';
 import ControlPanel from './components/ControlPanel';
 import CanvasEditor from './components/CanvasEditor';
-import { Shot, AspectRatioEnum, CameraParams } from './types';
-import { polishScript, generatePrompts, generateImage, editImage, extractGridPanel } from './services/geminiService';
+import QuotaMonitor from './components/QuotaMonitor';
+import { Shot, AspectRatioEnum, CameraParams, UsageMetadata } from './types';
+import { polishScript, generatePrompts, generateImage, editImage, extractGridPanel, translateText } from './services/geminiService';
 import JSZip from 'jszip';
+import { AI_MODELS } from './constants';
 
 const uuid = () => Math.random().toString(36).substr(2, 9);
 const randomSeed = () => Math.floor(Math.random() * 1000000000);
@@ -27,7 +29,8 @@ const INITIAL_SHOT: Shot = {
     distance: 1.0,
   },
   seed: randomSeed(),
-  isGrid: false
+  isGrid: false,
+  model: AI_MODELS[0].value // Default to Flash
 };
 
 const getCameraDescription = (params: CameraParams): string => {
@@ -65,6 +68,21 @@ const App: React.FC = () => {
   const [shots, setShots] = useState<Shot[]>([INITIAL_SHOT]);
   const [currentShotId, setCurrentShotId] = useState<string>('shot-1');
   const [isProcessing, setIsProcessing] = useState(false);
+  
+  // Quota Monitoring State
+  const [requestTimestamps, setRequestTimestamps] = useState<number[]>([]);
+  const [lastUsage, setLastUsage] = useState<UsageMetadata | null>(null);
+
+  const recordUsage = (usage: UsageMetadata) => {
+    const now = Date.now();
+    setRequestTimestamps(prev => {
+        // Filter out timestamps older than 60 seconds
+        const oneMinuteAgo = now - 60 * 1000;
+        const validTimestamps = prev.filter(t => t > oneMinuteAgo);
+        return [...validTimestamps, now];
+    });
+    setLastUsage(usage);
+  };
 
   const currentShot = shots.find(s => s.id === currentShotId) || shots[0];
 
@@ -83,7 +101,7 @@ const App: React.FC = () => {
         }
     });
     const nextNum = maxNum + 1;
-    setShots([...shots, { ...INITIAL_SHOT, id: newId, name: `Shot ${String(nextNum).padStart(2, '0')}`, versions: [], referenceImages: [], seed: randomSeed(), isGrid: false }]);
+    setShots([...shots, { ...INITIAL_SHOT, id: newId, name: `Shot ${String(nextNum).padStart(2, '0')}`, versions: [], referenceImages: [], seed: randomSeed(), isGrid: false, model: AI_MODELS[0].value }]);
     setCurrentShotId(newId);
   };
 
@@ -92,6 +110,37 @@ const App: React.FC = () => {
     const newShots = shots.filter(s => s.id !== id);
     setShots(newShots);
     if (currentShotId === id) setCurrentShotId(newShots[0].id);
+  };
+
+  const handleError = (e: any, actionName: string) => {
+    console.error(actionName, e);
+    
+    // Extract error message from various possible error structures
+    let errorMessage = e.message || "";
+    const eJson = JSON.stringify(e);
+    
+    // Handle {error: {code: 429, ...}} structure
+    if (e.error) {
+        if (e.error.message) errorMessage = e.error.message;
+        if (e.error.code === 429) errorMessage = `Rate Limit 429: ${errorMessage}`;
+    }
+
+    if (!errorMessage && typeof e === 'string') {
+        errorMessage = e;
+    }
+
+    const isRateLimit = 
+      errorMessage.includes("429") || 
+      errorMessage.includes("RESOURCE_EXHAUSTED") ||
+      errorMessage.includes("quota") ||
+      eJson.includes("429") || 
+      eJson.includes("RESOURCE_EXHAUSTED");
+
+    if (isRateLimit) {
+      alert(`⚠️ API 限流警告 (429)\n\n系统已尝试多次重试但仍失败。您的账户可能已达到当前的 API 调用配额。\n\n建议：\n1. 稍等几分钟再试。\n2. 切换到 'Flash' 模型 (消耗更低)。\n3. 检查您的 Google AI Studio 配额设置。`);
+    } else {
+      alert(`${actionName}失败: ${errorMessage || "未知错误"}`);
+    }
   };
 
   const handleGenerateImage = async (refreshSeed: boolean = false, isGrid: boolean = false) => {
@@ -128,19 +177,21 @@ const App: React.FC = () => {
         finalPrompt += ", generate 9 distinct variations based on the style, composition and subject of the provided reference image";
     }
 
-    console.log(`Generating [Refresh=${refreshSeed}, Grid=${isGrid}]:`, finalPrompt, "Seed:", activeSeed);
+    console.log(`Generating [Refresh=${refreshSeed}, Grid=${isGrid}, Model=${currentShot.model}]:`, finalPrompt, "Seed:", activeSeed);
 
     try {
-      const base64 = await generateImage(
+      const { base64, usage } = await generateImage(
           finalPrompt, 
           currentShot.aspectRatio, 
           consistencyImages, 
           activeSeed,
-          isGrid
+          isGrid,
+          currentShot.model // Pass current model
       );
+      recordUsage(usage);
       updateCurrentShot({ imageUrl: base64, versions: [...currentShot.versions, base64] });
     } catch (e) {
-      alert("图片生成失败: " + e);
+      handleError(e, "图片生成");
       updateCurrentShot({ isGrid: false }); // Reset grid if failed
     } finally {
       updateCurrentShot({ isGenerating: false });
@@ -158,12 +209,14 @@ const App: React.FC = () => {
         const cameraDesc = getCameraDescription(currentShot.cameraParams);
         const fullPrompt = `(${cameraDesc}), ${currentShot.aiPromptEn}`;
 
-        const newBase64 = await extractGridPanel(
+        const { base64: newBase64, usage } = await extractGridPanel(
             currentShot.imageUrl,
             index,
             fullPrompt,
-            currentShot.aspectRatio
+            currentShot.aspectRatio,
+            currentShot.model // Pass current model
         );
+        recordUsage(usage);
 
         updateCurrentShot({ 
            imageUrl: newBase64, 
@@ -171,7 +224,7 @@ const App: React.FC = () => {
            versions: [...currentShot.versions, newBase64] 
         });
     } catch (e) {
-        alert("高清提取失败: " + e);
+        handleError(e, "高清提取");
     } finally {
         updateCurrentShot({ isGenerating: false });
     }
@@ -180,10 +233,11 @@ const App: React.FC = () => {
   const handleEditImage = async (base64ImageFromCanvas: string, editPrompt: string) => {
       updateCurrentShot({ isGenerating: true });
       try {
-          const newImage = await editImage(base64ImageFromCanvas, editPrompt || currentShot.aiPromptEn);
+          const { base64: newImage, usage } = await editImage(base64ImageFromCanvas, editPrompt || currentShot.aiPromptEn, currentShot.model);
+          recordUsage(usage);
           updateCurrentShot({ imageUrl: newImage, versions: [...currentShot.versions, newImage] });
       } catch (e) {
-          alert("编辑失败: " + e);
+          handleError(e, "局部编辑");
       } finally {
         updateCurrentShot({ isGenerating: false });
       }
@@ -206,6 +260,17 @@ const App: React.FC = () => {
     });
   };
 
+  const handleTranslatePrompt = async () => {
+    if (!currentShot.aiPromptEn) return;
+    try {
+        const { text: cn, usage } = await translateText(currentShot.aiPromptEn);
+        recordUsage(usage);
+        updateCurrentShot({ aiPromptCn: cn });
+    } catch (e) {
+        console.error("Translation failed", e);
+    }
+  };
+
   return (
     <div className="flex h-screen w-screen bg-gray-900 text-gray-100 overflow-hidden font-sans">
       <Sidebar shots={shots} currentShotId={currentShotId} onSelectShot={setCurrentShotId} onAddShot={handleAddShot} onDeleteShot={handleDeleteShot} onDownloadAll={() => {}} />
@@ -215,19 +280,42 @@ const App: React.FC = () => {
              <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center font-bold">AI</div>
              <h2 className="text-lg font-bold tracking-wide">分镜头绘画师 <span className="text-xs font-normal text-gray-400 ml-2">v1.4 • 9宫格方案版</span></h2>
            </div>
-           <div className="text-sm text-gray-400">当前编辑: <span className="text-white font-medium">{currentShot.name}</span></div>
+           
+           {/* Monitor in Header */}
+           <div className="flex items-center gap-4">
+              <QuotaMonitor requestTimestamps={requestTimestamps} lastUsage={lastUsage} />
+              <div className="h-6 w-px bg-gray-700"></div>
+              <div className="text-sm text-gray-400">当前编辑: <span className="text-white font-medium">{currentShot.name}</span></div>
+           </div>
         </header>
         <main className="flex-1 flex overflow-hidden">
           <div className="w-[400px] border-r border-gray-700 bg-gray-900 flex flex-col">
-            <ControlPanel shot={currentShot} onUpdateShot={updateCurrentShot} onPolish={async () => {
-               setIsProcessing(true);
-               try { const polished = await polishScript(currentShot.script); updateCurrentShot({ enhancedScript: polished }); }
-               finally { setIsProcessing(false); }
-            }} onGeneratePrompt={async () => {
-               setIsProcessing(true);
-               try { const { en, cn } = await generatePrompts(currentShot.enhancedScript); updateCurrentShot({ aiPromptEn: en, aiPromptCn: cn }); }
-               finally { setIsProcessing(false); }
-            }} isProcessing={isProcessing} />
+            <ControlPanel 
+                shot={currentShot} 
+                onUpdateShot={updateCurrentShot} 
+                onPolish={async () => {
+                    setIsProcessing(true);
+                    try { 
+                        const { text: polished, usage } = await polishScript(currentShot.script); 
+                        recordUsage(usage);
+                        updateCurrentShot({ enhancedScript: polished }); 
+                    }
+                    catch(e) { handleError(e, "脚本润色"); }
+                    finally { setIsProcessing(false); }
+                }} 
+                onGeneratePrompt={async () => {
+                    setIsProcessing(true);
+                    try { 
+                        const { en, cn, usage } = await generatePrompts(currentShot.enhancedScript); 
+                        recordUsage(usage);
+                        updateCurrentShot({ aiPromptEn: en, aiPromptCn: cn }); 
+                    }
+                    catch(e) { handleError(e, "提示词生成"); }
+                    finally { setIsProcessing(false); }
+                }} 
+                onTranslate={handleTranslatePrompt}
+                isProcessing={isProcessing} 
+            />
           </div>
           <div className="flex-1 min-w-0 bg-black relative">
              <CanvasEditor 

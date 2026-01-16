@@ -1,14 +1,15 @@
 
 import React, { useRef, useState } from 'react';
 import { Shot, AspectRatioEnum } from '../types';
-import { ASPECT_RATIOS, PROMPT_KEYWORDS } from '../constants';
-import { Sparkles, Wand2, ImagePlus, X, Languages, Plus, Copy, Check } from 'lucide-react';
+import { ASPECT_RATIOS, PROMPT_KEYWORDS, AI_MODELS } from '../constants';
+import { Sparkles, Wand2, ImagePlus, X, Languages, Plus, Copy, Check, Loader2, Zap, Star } from 'lucide-react';
 
 interface ControlPanelProps {
   shot: Shot;
   onUpdateShot: (updates: Partial<Shot>) => void;
   onPolish: () => void;
   onGeneratePrompt: () => void;
+  onTranslate: () => Promise<void>;
   isProcessing: boolean;
 }
 
@@ -17,11 +18,13 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
   onUpdateShot,
   onPolish,
   onGeneratePrompt,
+  onTranslate,
   isProcessing
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [activeTab, setActiveTab] = useState<'en' | 'cn'>('en');
   const [copied, setCopied] = useState(false);
+  const [isTranslating, setIsTranslating] = useState(false);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -46,7 +49,8 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
 
   const addKeyword = (keyword: string) => {
     const currentPrompt = shot.aiPromptEn || "";
-    const separator = currentPrompt && !currentPrompt.endsWith(',') ? ', ' : '';
+    // Avoid double commas
+    const separator = currentPrompt.trim() === "" ? "" : (currentPrompt.trim().endsWith(',') ? ' ' : ', ');
     onUpdateShot({ aiPromptEn: currentPrompt + separator + keyword });
   };
 
@@ -55,6 +59,18 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
     navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleSwitchToCn = async () => {
+    setActiveTab('cn');
+    if (shot.aiPromptEn && !isTranslating) {
+        setIsTranslating(true);
+        try {
+            await onTranslate();
+        } finally {
+            setIsTranslating(false);
+        }
+    }
   };
 
   return (
@@ -111,20 +127,21 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
               EN
             </button>
             <button
-              onClick={() => setActiveTab('cn')}
-              className={`px-3 py-1 text-[10px] uppercase font-bold rounded-md transition-all ${
+              onClick={handleSwitchToCn}
+              className={`px-3 py-1 text-[10px] uppercase font-bold rounded-md transition-all flex items-center gap-1 ${
                 activeTab === 'cn' ? 'bg-indigo-600 text-white' : 'text-gray-500 hover:text-gray-300'
               }`}
             >
               CN
+              {isTranslating && <Loader2 size={10} className="animate-spin" />}
             </button>
           </div>
         </div>
 
         <div className="relative group">
           <textarea
-            value={activeTab === 'en' ? shot.aiPromptEn : shot.aiPromptCn}
-            readOnly={activeTab === 'cn'}
+            value={isTranslating ? "正在翻译..." : (activeTab === 'en' ? shot.aiPromptEn : shot.aiPromptCn)}
+            readOnly={activeTab === 'cn' || isTranslating}
             onChange={(e) => activeTab === 'en' && onUpdateShot({ aiPromptEn: e.target.value })}
             placeholder={activeTab === 'en' ? "English Prompt..." : "中文释义将在此显示..."}
             className={`w-full h-32 bg-gray-800 border border-gray-700 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none transition-all ${
@@ -140,20 +157,20 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
           </button>
         </div>
 
-        {/* Keyword Suggestions */}
-        <div className="space-y-3 pt-1">
+        {/* Keyword Suggestions - Styled Box */}
+        <div className="border border-indigo-500/30 bg-indigo-500/5 rounded-xl p-4 space-y-5">
           {PROMPT_KEYWORDS.map((group) => (
             <div key={group.category}>
-              <span className="text-[10px] text-gray-500 font-bold uppercase tracking-wider mb-2 block">{group.category}</span>
-              <div className="flex flex-wrap gap-1.5">
+              <span className="text-[10px] text-indigo-300/80 font-bold uppercase tracking-wider mb-2 block">{group.category}</span>
+              <div className="flex flex-wrap gap-2">
                 {group.items.map((kw) => (
                   <button
                     key={kw.value}
                     onClick={() => addKeyword(kw.value)}
-                    className="px-2 py-1 bg-gray-800 hover:bg-indigo-600/30 border border-gray-700 hover:border-indigo-500 text-gray-400 hover:text-indigo-300 rounded-lg text-[11px] transition-all flex items-center gap-1 group/btn"
+                    className="px-2.5 py-1 bg-gray-800 hover:bg-indigo-600 border border-gray-700 hover:border-indigo-500 text-gray-400 hover:text-white rounded-md text-[11px] transition-all flex items-center gap-1 group/btn shadow-sm"
                   >
                     <span>{kw.label}</span>
-                    <Plus size={10} className="opacity-0 group-hover/btn:opacity-100" />
+                    <Plus size={10} className="opacity-0 group-hover/btn:opacity-100 -ml-1 group-hover/btn:ml-0 transition-all" />
                   </button>
                 ))}
               </div>
@@ -220,6 +237,37 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
               </button>
             ))}
           </div>
+        </div>
+
+        {/* Model Selection */}
+        <div>
+           <label className="text-sm font-medium text-gray-300 block mb-3">6. AI模型 (Model)</label>
+           <div className="grid grid-cols-2 gap-3">
+              {AI_MODELS.map(model => (
+                <button
+                  key={model.value}
+                  onClick={() => onUpdateShot({ model: model.value })}
+                  className={`flex items-start gap-3 p-3 rounded-xl border text-left transition-all ${
+                    shot.model === model.value || (!shot.model && model.id === 'flash')
+                      ? 'bg-indigo-600/20 border-indigo-500 text-indigo-100 shadow-[0_0_15px_rgba(79,70,229,0.1)]'
+                      : 'bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-750'
+                  }`}
+                >
+                  <div className={`mt-0.5 p-1.5 rounded-lg ${shot.model === model.value || (!shot.model && model.id === 'flash') ? 'bg-indigo-500 text-white' : 'bg-gray-700 text-gray-500'}`}>
+                    {model.id === 'flash' ? <Zap size={14} fill="currentColor" /> : <Star size={14} fill="currentColor" />}
+                  </div>
+                  <div>
+                    <div className="text-xs font-bold flex items-center gap-1.5">
+                        {model.label} 
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded ${shot.model === model.value || (!shot.model && model.id === 'flash') ? 'bg-indigo-500/30 text-indigo-300' : 'bg-gray-700 text-gray-500'}`}>
+                           {model.sub}
+                        </span>
+                    </div>
+                    <div className="text-[10px] opacity-70 mt-1 leading-tight">{model.desc}</div>
+                  </div>
+                </button>
+              ))}
+           </div>
         </div>
       </div>
     </div>

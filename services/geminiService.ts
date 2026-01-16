@@ -14,7 +14,7 @@ const getAiClient = () => {
 const retryOperation = async <T>(
   operation: () => Promise<T>, 
   maxRetries = 5, 
-  initialDelay = 2000
+  initialDelay = 3000
 ): Promise<T> => {
   let lastError: any;
   for (let i = 0; i < maxRetries; i++) {
@@ -24,7 +24,6 @@ const retryOperation = async <T>(
       lastError = error;
       
       // Analyze error structure
-      // The API might return { error: { code: 429, ... } } or throw a standard Error
       const errBody = error?.error || error; 
       const code = errBody?.code || error?.status;
       const message = errBody?.message || error?.message || "";
@@ -40,7 +39,8 @@ const retryOperation = async <T>(
           message.includes('quota') ||
           message.includes('exceeded')
         )) ||
-        errStr.includes('RESOURCE_EXHAUSTED');
+        errStr.includes('RESOURCE_EXHAUSTED') ||
+        errStr.includes('429');
       
       const isServerOverload = code === 503 || (message && message.includes('503'));
 
@@ -55,7 +55,18 @@ const retryOperation = async <T>(
         continue;
       }
       
-      // If not retriable or retries exhausted, rethrow
+      // If we are throwing the error (final attempt or non-retriable),
+      // ensure it's a standard Error object with a clear message.
+      if (i === maxRetries - 1 || (!isRateLimit && !isServerOverload)) {
+          // Check if it's the specific raw JSON structure and normalize it
+          if (errBody && errBody.code && errBody.message) {
+              const normalizedMessage = `[${errBody.code}] ${errBody.status || 'Error'}: ${errBody.message}`;
+              const newError = new Error(normalizedMessage);
+              (newError as any).originalError = error;
+              throw newError;
+          }
+      }
+
       throw error;
     }
   }

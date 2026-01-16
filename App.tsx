@@ -119,10 +119,9 @@ const App: React.FC = () => {
     let errorMessage = e.message || "";
     const eJson = JSON.stringify(e);
     
-    // Handle {error: {code: 429, ...}} structure
-    if (e.error) {
-        if (e.error.message) errorMessage = e.error.message;
-        if (e.error.code === 429) errorMessage = `Rate Limit 429: ${errorMessage}`;
+    // Handle specific JSON error structure if present (though service should now normalize this)
+    if (e.error && e.error.message) {
+        errorMessage = e.error.message;
     }
 
     if (!errorMessage && typeof e === 'string') {

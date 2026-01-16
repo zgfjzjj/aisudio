@@ -15,6 +15,10 @@ export interface Shot {
   seed: number; // 用于锁定画面内容
   isGrid?: boolean; // 新增：标记是否为9宫格方案图
   model: string; // 新增：使用的模型版本
+  
+  // UX State Flags (Visual hints only, non-blocking)
+  isScriptDirty?: boolean; // 脚本已修改，建议重新润色
+  isEnhancedScriptDirty?: boolean; // 润色结果已修改，建议重新生成Prompt
 }
 
 export interface CameraParams {

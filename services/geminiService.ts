@@ -393,7 +393,15 @@ export const editImage = async (
     }
   });
 
-  parts.push({ text: `Modify this image: ${prompt}. Maintain continuity.` });
+  // LOGIC FIX: Explicitly instruct AI to use the red strokes as a mask/guide
+  parts.push({ 
+    text: `The red strokes in the image mark the specific area to edit/inpainting. 
+    INSTRUCTION: Replace the content covered by or contained within the red marked area with: "${prompt}".
+    CRITICAL: 
+    1. The rest of the image (outside the red marks) must remain UNCHANGED.
+    2. Remove the red strokes in the final output.
+    3. Maintain lighting and style continuity.` 
+  });
 
   try {
     const response = await retryOperation(() => ai.models.generateContent({

@@ -1,9 +1,10 @@
 
 import React, { useEffect, useRef, useState } from 'react';
-import { Shot } from '../types';
+import { Shot, UsageMetadata } from '../types';
 import { BRUSH_COLORS } from '../constants';
 import { Brush, Loader2, Download, RefreshCw, Palette, X, Undo2, Sparkles, Video, Grid3X3, MousePointerClick } from 'lucide-react';
 import CameraGizmo from './CameraGizmo';
+import QuotaMonitor from './QuotaMonitor';
 
 const getCameraDesc = (params: any) => {
     const { azimuth, elevation, distance } = params;
@@ -47,6 +48,8 @@ interface CanvasEditorProps {
   onSelectVersion: (index: number) => void;
   onDeleteVersion: (index: number) => void;
   onUpdateCamera: (params: any) => void;
+  requestTimestamps: number[];
+  lastUsage: UsageMetadata | null;
 }
 
 const CanvasEditor: React.FC<CanvasEditorProps> = ({
@@ -58,7 +61,9 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
   onEdit,
   onSelectVersion,
   onDeleteVersion,
-  onUpdateCamera
+  onUpdateCamera,
+  requestTimestamps,
+  lastUsage
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -171,7 +176,7 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
     <div className="flex flex-col h-full bg-gray-900 relative">
       {/* 镜头控制器 悬浮面板 */}
       {showCameraControl && (
-        <div className="absolute top-20 right-6 z-50 w-80 animate-in fade-in zoom-in duration-200">
+        <div className="absolute top-16 right-6 z-50 w-80 animate-in fade-in zoom-in duration-200">
            <div className="flex items-center justify-between mb-2 bg-gray-800 p-2 rounded-t-xl border-x border-t border-gray-700 shadow-lg">
               <span className="text-xs font-bold text-indigo-400 flex items-center gap-1"><Video size={14}/> 3D 镜头参数</span>
               <button onClick={() => setShowCameraControl(false)} className="text-gray-500 hover:text-white"><X size={14}/></button>
@@ -186,7 +191,7 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
       )}
 
       {/* Toolbar */}
-      <div className="h-14 border-b border-gray-700 bg-gray-800 flex items-center justify-between px-4 z-10">
+      <div className="h-14 border-b border-gray-700 bg-gray-800 flex items-center justify-between px-4 z-10 shrink-0">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1 bg-gray-700 rounded-lg p-1">
             <button
@@ -214,6 +219,12 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
+           {/* Integrated Quota Monitor */}
+           <div className="hidden lg:block mr-2 opacity-90 scale-95 origin-right">
+              <QuotaMonitor requestTimestamps={requestTimestamps} lastUsage={lastUsage} />
+           </div>
+           <div className="hidden lg:block w-px h-6 bg-gray-700 mx-1"></div>
+
            <button 
              onClick={() => setShowCameraControl(!showCameraControl)}
              className={`px-3 py-1.5 rounded-lg flex items-center gap-2 text-xs font-bold border transition-all ${showCameraControl ? 'bg-indigo-600 border-indigo-500 text-white shadow-md' : 'bg-gray-700 border-gray-600 text-gray-300 hover:bg-gray-600'}`}
@@ -301,7 +312,7 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
       </div>
 
       {/* Footer Area */}
-      <div className="flex flex-col border-t border-gray-700 bg-gray-800">
+      <div className="flex flex-col border-t border-gray-700 bg-gray-800 shrink-0">
           {shot.versions.length > 0 && (
              <div className="h-24 border-b border-gray-700 bg-gray-900/50 flex items-center gap-4 px-4 overflow-x-auto">
                 <div className="flex items-center gap-2 h-full py-2">

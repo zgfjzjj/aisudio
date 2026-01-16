@@ -2,7 +2,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { Shot, AspectRatioEnum } from '../types';
 import { ASPECT_RATIOS, PROMPT_KEYWORDS, AI_MODELS } from '../constants';
-import { Sparkles, Wand2, ImagePlus, X, Languages, Plus, Copy, Check, Loader2, Zap, Star, Eye, UploadCloud, Minus } from 'lucide-react';
+import { Sparkles, Wand2, ImagePlus, X, Languages, Plus, Copy, Check, Loader2, Zap, Star, Eye, UploadCloud, Minus, AlertCircle, ArrowRight } from 'lucide-react';
 
 interface ControlPanelProps {
   shot: Shot;
@@ -11,6 +11,7 @@ interface ControlPanelProps {
   onGeneratePrompt: () => void;
   onTranslate: () => Promise<void>;
   isProcessing: boolean;
+  onError: (title: string, items: string[]) => void;
 }
 
 // Utility to safely escape strings for RegExp
@@ -24,7 +25,8 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
   onPolish,
   onGeneratePrompt,
   onTranslate,
-  isProcessing
+  isProcessing,
+  onError
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [activeTab, setActiveTab] = useState<'en' | 'cn'>('en');
@@ -42,7 +44,6 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
     }
   }, [uploadStatus]);
 
-  // MEMORY FIX: Compress and return Blob URL instead of huge Base64 string
   const processImageToBlobUrl = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -76,7 +77,6 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
             ctx.drawImage(img, 0, 0, width, height);
           }
           
-          // Convert to Blob, then Create Object URL
           canvas.toBlob((blob) => {
              if (blob) {
                 const url = URL.createObjectURL(blob);
@@ -101,30 +101,29 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
       
       const processedImages: string[] = [];
       const MAX_FILE_SIZE = 10 * 1024 * 1024; 
+      const errors: string[] = [];
 
-      let hasLargeFiles = false;
+      let hasOptimization = false;
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
 
         if (file.size > MAX_FILE_SIZE) {
-           alert(`图片 "${file.name}" 体积过大 (超过10MB)。`);
+           errors.push(`${file.name} (文件超过10MB)`);
            continue; 
         }
 
         if (file.size > 1 * 1024 * 1024) { 
-            hasLargeFiles = true;
+            hasOptimization = true;
             setUploadStatus({ loading: true, msg: `正在优化: ${file.name}...` });
         }
 
         try {
-            // Returns a "blob:..." URL now
             const blobUrl = await processImageToBlobUrl(file);
             processedImages.push(blobUrl);
         } catch (err) {
             console.error("Failed to process image", err);
-            setUploadStatus({ loading: false, msg: `处理失败: ${file.name}` });
-            return;
+            errors.push(`${file.name} (处理失败)`);
         }
       }
       
@@ -132,20 +131,27 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
         onUpdateShot({
             referenceImages: [...shot.referenceImages, ...processedImages]
         });
-        const msg = hasLargeFiles ? "图片已优化并添加" : "图片添加成功";
+        const msg = hasOptimization ? "图片已压缩并添加" : `成功添加 ${processedImages.length} 张图片`;
         setUploadStatus({ loading: false, msg: msg });
       } else {
         setUploadStatus(null);
       }
+
+      if (errors.length > 0) {
+          onError("以下图片未能添加", errors);
+      }
+
       if (e.target) e.target.value = '';
     }
   };
 
   const removeRefImage = (index: number) => {
+    const imgUrl = shot.referenceImages[index];
+    if (imgUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(imgUrl);
+    }
+    
     const newImages = [...shot.referenceImages];
-    // If it's a blob URL, we should ideally revoke it to prevent leaks, 
-    // but React Lifecycle makes strict revocation hard without a custom hook. 
-    // Since we are moving to DB storage, it's less critical than Base64 string leaks.
     newImages.splice(index, 1);
     onUpdateShot({ referenceImages: newImages });
   };
@@ -214,16 +220,10 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
     
     const sourceText = (shot.aiPromptEn || "").trim();
 
-    // RULE 1: Empty Guard
     if (!sourceText) return;
-
-    // LOGIC FIX: Meaningful Content Guard
-    // Only translate if there are letters or Chinese characters. 
-    // Skips pure numbers "123" or symbols "..."
     const hasMeaningfulContent = /[a-zA-Z\u4e00-\u9fa5]/.test(sourceText);
     if (!hasMeaningfulContent) return;
 
-    // RULE 2: Pure Chinese Guard
     const hasChinese = /[\u4e00-\u9fa5]/.test(sourceText);
     const hasEnglish = /[a-zA-Z]/.test(sourceText);
     
@@ -234,7 +234,6 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
         return;
     }
 
-    // RULE 3: Cache Guard
     if (sourceText === lastTranslatedSource.current && shot.aiPromptCn) {
         return;
     }
@@ -256,40 +255,63 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
     <>
       <div className="flex flex-col h-full overflow-y-auto p-6 space-y-6 relative z-10">
         {/* Script Section */}
-        <div className="space-y-2">
-          <label className="text-sm font-medium text-gray-300">1. 分镜脚本</label>
+        <div className="space-y-2 relative">
+          <label className="text-sm font-medium text-gray-300 flex items-center justify-between">
+              1. 分镜脚本
+              {shot.isScriptDirty && <span className="text-[10px] text-yellow-500 font-bold animate-pulse">已修改</span>}
+          </label>
           <textarea
             value={shot.script}
             onChange={(e) => onUpdateShot({ script: e.target.value })}
             placeholder="输入简略的分镜头描述..."
-            className="w-full h-24 bg-gray-800 border border-gray-700 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none transition-all"
+            className={`w-full h-24 bg-gray-800 border rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none transition-all ${
+                shot.isScriptDirty ? 'border-yellow-500/50' : 'border-gray-700'
+            }`}
           />
           <button
             onClick={onPolish}
             disabled={!shot.script || isProcessing}
-            className="flex items-center gap-2 text-xs text-indigo-400 hover:text-indigo-300 disabled:opacity-50 font-medium"
+            className={`flex items-center gap-2 text-xs font-bold transition-colors ${
+                shot.isScriptDirty ? 'text-yellow-400 hover:text-yellow-300' : 'text-indigo-400 hover:text-indigo-300'
+            } disabled:opacity-50`}
           >
             <Sparkles size={14} />
-            <span>智能润色 (Gemini)</span>
+            <span>智能润色 {shot.isScriptDirty && "(建议刷新)"}</span>
           </button>
         </div>
 
         {/* Enhanced Script */}
         <div className="space-y-2">
-          <label className="text-sm font-medium text-gray-300">2. 润色结果</label>
-          <textarea
-            value={shot.enhancedScript}
-            onChange={(e) => onUpdateShot({ enhancedScript: e.target.value })}
-            placeholder="AI润色后的详细描述将显示在这里..."
-            className="w-full h-32 bg-gray-800 border border-gray-700 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none transition-all"
-          />
+          <label className="text-sm font-medium text-gray-300 flex items-center justify-between">
+              2. 润色结果
+              {shot.isEnhancedScriptDirty && <span className="text-[10px] text-yellow-500 font-bold animate-pulse">需要更新提示词</span>}
+          </label>
+          <div className="relative">
+            <textarea
+                value={shot.enhancedScript}
+                onChange={(e) => onUpdateShot({ enhancedScript: e.target.value })}
+                placeholder="AI润色后的详细描述将显示在这里..."
+                className={`w-full h-32 bg-gray-800 border rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none transition-all ${
+                    shot.isEnhancedScriptDirty ? 'border-yellow-500/50' : 'border-gray-700'
+                }`}
+            />
+            {/* Visual connector line to prompt button if dirty */}
+            {shot.isEnhancedScriptDirty && (
+                <div className="absolute -bottom-6 left-1/2 w-0.5 h-6 bg-yellow-500/50 -translate-x-1/2 z-0"></div>
+            )}
+          </div>
+          
           <button
             onClick={onGeneratePrompt}
             disabled={!shot.enhancedScript || isProcessing}
-            className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl flex items-center justify-center gap-2 text-sm font-bold transition-all shadow-lg shadow-indigo-600/20 disabled:opacity-50 disabled:shadow-none"
+            className={`w-full py-2.5 rounded-xl flex items-center justify-center gap-2 text-sm font-bold transition-all shadow-lg relative z-10 ${
+                shot.isEnhancedScriptDirty 
+                 ? 'bg-yellow-600 hover:bg-yellow-500 text-white shadow-yellow-600/20 ring-2 ring-yellow-500/50'
+                 : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/20'
+            } disabled:opacity-50 disabled:shadow-none`}
           >
             <Wand2 size={16} />
-            <span>生成 AI 绘画提示词</span>
+            <span>生成 AI 绘画提示词 {shot.isEnhancedScriptDirty && <ArrowRight size={14} className="animate-bounce-x"/>}</span>
           </button>
         </div>
 
@@ -420,7 +442,10 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
                 onChange={handleFileUpload}
               />
             </div>
-            <p className="text-[10px] text-gray-500 mt-2">* 支持上传本地图片 (自动优化至2K分辨率)</p>
+            <p className="text-[10px] text-gray-500 mt-2 flex items-center gap-1.5">
+               <AlertCircle size={10} className="text-indigo-400" /> 
+               支持上传本地图片 (自动优化至2K分辨率, 最大10MB)
+            </p>
           </div>
 
           <div>

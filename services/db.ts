@@ -1,4 +1,3 @@
-
 import { Shot } from "../types";
 
 const DB_NAME = "AI_Storyboard_DB";
@@ -72,16 +71,25 @@ const serializeShotForDB = async (shot: Shot): Promise<any> => {
   
   // Convert imageUrl URL -> Blob
   if (clone.imageUrl && clone.imageUrl.startsWith('blob:')) {
-    const resp = await fetch(clone.imageUrl);
-    clone.imageUrl = await resp.blob() as any;
+    try {
+        const resp = await fetch(clone.imageUrl);
+        clone.imageUrl = await resp.blob() as any;
+    } catch (e) {
+        console.warn(`Failed to serialize imageUrl for shot ${shot.id}`, e);
+    }
   }
 
   // Convert versions array
   if (clone.versions && clone.versions.length > 0) {
     const blobVersions = await Promise.all(clone.versions.map(async (v) => {
       if (v.startsWith('blob:')) {
-        const resp = await fetch(v);
-        return await resp.blob();
+        try {
+            const resp = await fetch(v);
+            return await resp.blob();
+        } catch (e) {
+             console.warn(`Failed to serialize version for shot ${shot.id}`, e);
+             return v;
+        }
       }
       return v;
     }));
@@ -92,8 +100,13 @@ const serializeShotForDB = async (shot: Shot): Promise<any> => {
   if (clone.referenceImages && clone.referenceImages.length > 0) {
      const blobRefs = await Promise.all(clone.referenceImages.map(async (v) => {
        if (v.startsWith('blob:')) {
-          const resp = await fetch(v);
-          return await resp.blob();
+          try {
+              const resp = await fetch(v);
+              return await resp.blob();
+          } catch (e) {
+              console.warn(`Failed to serialize refImage for shot ${shot.id}`, e);
+              return v;
+          }
        } else if (v.startsWith('data:')) {
           // If it's still base64 (e.g. fresh upload), convert to Blob for storage efficiency
           return base64ToBlob(v);
@@ -135,25 +148,27 @@ const deserializeShotFromDB = (shotData: any): Shot => {
 // Concurrency Fix: We now save EACH shot individually instead of the whole array.
 // This allows Tab A to update Shot 1 and Tab B to update Shot 2 without overwriting each other.
 export const saveShotsToDB = async (shots: Shot[]): Promise<void> => {
+  // 1. Serialize everything OUTSIDE the transaction.
+  // IndexedDB transactions auto-commit if the event loop spins (e.g. await fetch).
+  // So we must prepare all data first.
+  const serializedShots = await Promise.all(shots.map(shot => serializeShotForDB(shot)));
+
   const db = await openDB();
-  
-  // We process sequentially or parallel. 
-  // IMPORTANT: We only save what is passed. 
-  // In a real granular app, we would only save the modified shot. 
-  // But to keep API simple for App.tsx, we iterate and put all.
-  // Since IDB writes are fast and row-level, this is safer than overwriting a single huge JSON.
   
   const tx = db.transaction([STORE_NAME], "readwrite");
   const store = tx.objectStore(STORE_NAME);
 
-  for (const shot of shots) {
-    const serialized = await serializeShotForDB(shot);
+  // 2. Perform DB operations synchronously within the transaction block
+  for (const serialized of serializedShots) {
     store.put(serialized);
   }
 
   return new Promise((resolve, reject) => {
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject("Transaction failed");
+    tx.onerror = (event) => {
+        console.error("Transaction error:", (event.target as any).error);
+        reject("Transaction failed");
+    };
   });
 };
 

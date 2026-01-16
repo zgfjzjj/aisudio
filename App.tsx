@@ -1,13 +1,16 @@
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
 import ControlPanel from './components/ControlPanel';
 import CanvasEditor from './components/CanvasEditor';
 import QuotaMonitor from './components/QuotaMonitor';
+import GalleryModal from './components/GalleryModal';
 import { Shot, AspectRatioEnum, CameraParams, UsageMetadata } from './types';
-import { polishScript, generatePrompts, generateImage, editImage, extractGridPanel, translateText } from './services/geminiService';
+import { polishScriptStream, generatePromptsStream, generateImage, editImage, extractGridPanel, translateTextStream } from './services/geminiService';
+import { saveShotsToDB, loadShotsFromDB, migrateFromLocalStorage, base64ToBlob, blobToBase64 } from './services/db'; 
 import JSZip from 'jszip';
 import { AI_MODELS } from './constants';
+import { Loader2 } from 'lucide-react';
 
 const uuid = () => Math.random().toString(36).substr(2, 9);
 const randomSeed = () => Math.floor(Math.random() * 1000000000);
@@ -30,7 +33,7 @@ const INITIAL_SHOT: Shot = {
   },
   seed: randomSeed(),
   isGrid: false,
-  model: AI_MODELS[0].value // Default to Flash
+  model: AI_MODELS[0].value 
 };
 
 const getCameraDescription = (params: CameraParams): string => {
@@ -64,19 +67,77 @@ const getCameraDescription = (params: CameraParams): string => {
   return `${view}, ${angle}, ${shotSize}`;
 }
 
-const App: React.FC = () => {
+export function App() {
   const [shots, setShots] = useState<Shot[]>([INITIAL_SHOT]);
-  const [currentShotId, setCurrentShotId] = useState<string>('shot-1');
+  const [isDbLoaded, setIsDbLoaded] = useState(false); 
+  const [showGallery, setShowGallery] = useState(false); 
+
+  // Load from DB on Mount
+  useEffect(() => {
+    const initData = async () => {
+      try {
+        await migrateFromLocalStorage();
+        const dbData = await loadShotsFromDB();
+        if (dbData && dbData.length > 0) {
+          setShots(dbData);
+        }
+      } catch (error) {
+        console.error("Failed to initialize database:", error);
+      } finally {
+        setIsDbLoaded(true);
+      }
+    };
+    initData();
+  }, []);
+
+  const [currentShotId, setCurrentShotId] = useState<string>(() => {
+     try {
+       const saved = localStorage.getItem('ai-storyboard-current-id');
+       return saved || 'shot-1';
+     } catch {
+       return 'shot-1';
+     }
+  });
+
   const [isProcessing, setIsProcessing] = useState(false);
   
-  // Quota Monitoring State
-  const [requestTimestamps, setRequestTimestamps] = useState<number[]>([]);
+  // Quota Monitoring
+  const [requestTimestamps, setRequestTimestamps] = useState<number[]>(() => {
+    try {
+      const saved = localStorage.getItem('ai-storyboard-quota');
+      if (!saved) return [];
+      const timestamps = JSON.parse(saved);
+      const now = Date.now();
+      return timestamps.filter((t: number) => t > now - 60 * 1000);
+    } catch {
+      return [];
+    }
+  });
   const [lastUsage, setLastUsage] = useState<UsageMetadata | null>(null);
+
+  // DB Persistence Effect (Debounced)
+  useEffect(() => {
+    if (!isDbLoaded) return; 
+
+    const timer = setTimeout(() => {
+        saveShotsToDB(shots).catch(err => console.error("Auto-save failed:", err));
+    }, 1000); 
+
+    return () => clearTimeout(timer);
+  }, [shots, isDbLoaded]);
+
+  // Minor metadata persistence in LS (Safe)
+  useEffect(() => {
+    localStorage.setItem('ai-storyboard-current-id', currentShotId);
+  }, [currentShotId]);
+
+  useEffect(() => {
+    localStorage.setItem('ai-storyboard-quota', JSON.stringify(requestTimestamps));
+  }, [requestTimestamps]);
 
   const recordUsage = (usage: UsageMetadata) => {
     const now = Date.now();
     setRequestTimestamps(prev => {
-        // Filter out timestamps older than 60 seconds
         const oneMinuteAgo = now - 60 * 1000;
         const validTimestamps = prev.filter(t => t > oneMinuteAgo);
         return [...validTimestamps, now];
@@ -114,26 +175,12 @@ const App: React.FC = () => {
 
   const handleError = (e: any, actionName: string) => {
     console.error(actionName, e);
-    
-    // Extract error message from various possible error structures
     let errorMessage = e.message || "";
     const eJson = JSON.stringify(e);
-    
-    // Handle specific JSON error structure if present (though service should now normalize this)
-    if (e.error && e.error.message) {
-        errorMessage = e.error.message;
-    }
+    if (e.error && e.error.message) errorMessage = e.error.message;
+    if (!errorMessage && typeof e === 'string') errorMessage = e;
 
-    if (!errorMessage && typeof e === 'string') {
-        errorMessage = e;
-    }
-
-    const isRateLimit = 
-      errorMessage.includes("429") || 
-      errorMessage.includes("RESOURCE_EXHAUSTED") ||
-      errorMessage.includes("quota") ||
-      eJson.includes("429") || 
-      eJson.includes("RESOURCE_EXHAUSTED");
+    const isRateLimit = errorMessage.includes("429") || errorMessage.includes("RESOURCE_EXHAUSTED");
 
     if (isRateLimit) {
       alert(`⚠️ API 限流警告 (429)\n\n系统已尝试多次重试但仍失败。您的账户可能已达到当前的 API 调用配额。\n\n建议：\n1. 稍等几分钟再试。\n2. 切换到 'Flash' 模型 (消耗更低)。\n3. 检查您的 Google AI Studio 配额设置。`);
@@ -142,86 +189,83 @@ const App: React.FC = () => {
     }
   };
 
+  // Helper: Convert Base64 (from API) -> Blob URL (for State)
+  const processBase64ToStateUrl = (base64: string): string => {
+      const blob = base64ToBlob(base64);
+      return URL.createObjectURL(blob);
+  };
+
+  // Helper: Prepare Images for API (State Blob URLs -> API Base64)
+  const prepareImagesForApi = async (urls: string[]): Promise<string[]> => {
+      return Promise.all(urls.map(url => blobToBase64(url)));
+  };
+
   const handleGenerateImage = async (refreshSeed: boolean = false, isGrid: boolean = false) => {
     if (!currentShot.aiPromptEn) return;
-    
     const activeSeed = refreshSeed ? randomSeed() : currentShot.seed;
     
-    const consistencyImages = [...currentShot.referenceImages];
-    
-    // 修改核心逻辑：
-    // 允许在生成网格(isGrid)时，将当前图片作为垫图(参考图)
-    // 这样生成的9张方案就会基于当前选中的这张图进行变体生成
+    // Prepare API images (Convert Blob URLs back to Base64)
+    const consistencyUrls = [...currentShot.referenceImages];
     if (currentShot.imageUrl && !currentShot.isGrid) {
-        // 条件：
-        // 1. 不刷新种子 (保持当前图微调)
-        // 2. 或者 是生成网格 (希望基于当前图生成变体)
         if (!refreshSeed || isGrid) {
-            consistencyImages.unshift(currentShot.imageUrl);
+            consistencyUrls.unshift(currentShot.imageUrl);
         }
     }
-    
+
     updateCurrentShot({ isGenerating: true, seed: activeSeed, isGrid: isGrid });
     
     const cameraDesc = getCameraDescription(currentShot.cameraParams);
     let finalPrompt = `(${cameraDesc}), ${currentShot.aiPromptEn}`;
-
-    // 如果是单图重绘且有参考图，强调保持一致性
     if (!refreshSeed && currentShot.imageUrl && !isGrid) {
         finalPrompt += ", maintain exact character appearance and environment details from the reference image, only change the camera angle";
     }
-    
-    // 如果是基于原图生成网格，添加变体描述，引导 AI 基于此图发散
     if (isGrid && currentShot.imageUrl && !currentShot.isGrid) {
         finalPrompt += ", generate 9 distinct variations based on the style, composition and subject of the provided reference image";
     }
 
-    console.log(`Generating [Refresh=${refreshSeed}, Grid=${isGrid}, Model=${currentShot.model}]:`, finalPrompt, "Seed:", activeSeed);
-
     try {
+      // Conversion step (Async)
+      const consistencyBase64s = await prepareImagesForApi(consistencyUrls);
+
       const { base64, usage } = await generateImage(
           finalPrompt, 
           currentShot.aspectRatio, 
-          consistencyImages, 
+          consistencyBase64s, 
           activeSeed,
           isGrid,
-          currentShot.model // Pass current model
+          currentShot.model 
       );
       recordUsage(usage);
-      updateCurrentShot({ imageUrl: base64, versions: [...currentShot.versions, base64] });
+
+      // Save to State as Blob URL (Lightweight)
+      const blobUrl = processBase64ToStateUrl(base64);
+
+      updateCurrentShot({ imageUrl: blobUrl, versions: [...currentShot.versions, blobUrl] });
     } catch (e) {
       handleError(e, "图片生成");
-      updateCurrentShot({ isGrid: false }); // Reset grid if failed
+      updateCurrentShot({ isGrid: false });
     } finally {
       updateCurrentShot({ isGenerating: false });
     }
   };
 
   const handleExtractGridImage = async (index: number) => {
-    // index: 1-9
     if (!currentShot.imageUrl) return;
-
-    // 不再使用Canvas裁剪，而是调用AI重绘
     updateCurrentShot({ isGenerating: true });
-
     try {
         const cameraDesc = getCameraDescription(currentShot.cameraParams);
         const fullPrompt = `(${cameraDesc}), ${currentShot.aiPromptEn}`;
+        
+        // Convert Grid Image Blob URL -> Base64 for API
+        const gridBase64 = await blobToBase64(currentShot.imageUrl);
 
         const { base64: newBase64, usage } = await extractGridPanel(
-            currentShot.imageUrl,
-            index,
-            fullPrompt,
-            currentShot.aspectRatio,
-            currentShot.model // Pass current model
+            gridBase64, index, fullPrompt, currentShot.aspectRatio, currentShot.model
         );
         recordUsage(usage);
 
-        updateCurrentShot({ 
-           imageUrl: newBase64, 
-           isGrid: false, 
-           versions: [...currentShot.versions, newBase64] 
-        });
+        const newBlobUrl = processBase64ToStateUrl(newBase64);
+        updateCurrentShot({ imageUrl: newBlobUrl, isGrid: false, versions: [...currentShot.versions, newBlobUrl] });
     } catch (e) {
         handleError(e, "高清提取");
     } finally {
@@ -230,11 +274,14 @@ const App: React.FC = () => {
   };
 
   const handleEditImage = async (base64ImageFromCanvas: string, editPrompt: string) => {
+      // Canvas already returns Base64, no need to convert source
       updateCurrentShot({ isGenerating: true });
       try {
           const { base64: newImage, usage } = await editImage(base64ImageFromCanvas, editPrompt || currentShot.aiPromptEn, currentShot.model);
           recordUsage(usage);
-          updateCurrentShot({ imageUrl: newImage, versions: [...currentShot.versions, newImage] });
+          
+          const newBlobUrl = processBase64ToStateUrl(newImage);
+          updateCurrentShot({ imageUrl: newBlobUrl, versions: [...currentShot.versions, newBlobUrl] });
       } catch (e) {
           handleError(e, "局部编辑");
       } finally {
@@ -246,41 +293,87 @@ const App: React.FC = () => {
     const newVersions = [...currentShot.versions];
     const deletedImage = newVersions[index];
     newVersions.splice(index, 1);
-
-    // 如果删除的是当前显示的图片，切换到列表中的最后一张，如果列表为空则置空
+    
     let nextImageUrl = currentShot.imageUrl;
     if (currentShot.imageUrl === deletedImage) {
         nextImageUrl = newVersions.length > 0 ? newVersions[newVersions.length - 1] : undefined;
     }
+    updateCurrentShot({ versions: newVersions, imageUrl: nextImageUrl });
+  };
 
-    updateCurrentShot({
-        versions: newVersions,
-        imageUrl: nextImageUrl
-    });
+  // Streaming Handlers
+  const handlePolishScript = async () => {
+    setIsProcessing(true);
+    updateCurrentShot({ enhancedScript: '' }); // Clear field to show typing effect
+    try {
+        const usage = await polishScriptStream(currentShot.script, (chunkText) => {
+             updateCurrentShot({ enhancedScript: chunkText });
+        });
+        recordUsage(usage);
+    } catch (e) {
+        handleError(e, "脚本润色");
+    } finally {
+        setIsProcessing(false);
+    }
+  };
+
+  // New Streaming Handler for Prompts
+  const handleGeneratePrompts = async () => {
+    if (!currentShot.enhancedScript) return;
+    setIsProcessing(true);
+    updateCurrentShot({ aiPromptEn: '', aiPromptCn: '' }); // Clear fields
+    try {
+        const usage = await generatePromptsStream(currentShot.enhancedScript, (en, cn) => {
+            updateCurrentShot({ aiPromptEn: en, aiPromptCn: cn });
+        });
+        recordUsage(usage);
+    } catch (e) {
+        handleError(e, "提示词生成");
+    } finally {
+        setIsProcessing(false);
+    }
   };
 
   const handleTranslatePrompt = async () => {
     if (!currentShot.aiPromptEn) return;
+    updateCurrentShot({ aiPromptCn: '' });
     try {
-        const { text: cn, usage } = await translateText(currentShot.aiPromptEn);
+        const usage = await translateTextStream(currentShot.aiPromptEn, (chunkText) => {
+             updateCurrentShot({ aiPromptCn: chunkText });
+        });
         recordUsage(usage);
-        updateCurrentShot({ aiPromptCn: cn });
     } catch (e) {
         console.error("Translation failed", e);
     }
   };
 
+  if (!isDbLoaded) {
+     return (
+        <div className="flex h-screen w-screen bg-gray-900 items-center justify-center flex-col text-gray-400">
+            <Loader2 size={40} className="animate-spin text-indigo-500 mb-4"/>
+            <p>正在初始化数据库...</p>
+        </div>
+     )
+  }
+
   return (
     <div className="flex h-screen w-screen bg-gray-900 text-gray-100 overflow-hidden font-sans">
-      <Sidebar shots={shots} currentShotId={currentShotId} onSelectShot={setCurrentShotId} onAddShot={handleAddShot} onDeleteShot={handleDeleteShot} onDownloadAll={() => {}} />
+      <Sidebar 
+        shots={shots} 
+        currentShotId={currentShotId} 
+        onSelectShot={setCurrentShotId} 
+        onAddShot={handleAddShot} 
+        onDeleteShot={handleDeleteShot} 
+        onDownloadAll={() => {}} 
+        onOpenGallery={() => setShowGallery(true)}
+      />
       <div className="flex-1 flex flex-col min-w-0">
         <header className="h-14 border-b border-gray-700 bg-gray-800 flex items-center px-6 justify-between">
            <div className="flex items-center gap-3">
              <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center font-bold">AI</div>
-             <h2 className="text-lg font-bold tracking-wide">分镜头绘画师 <span className="text-xs font-normal text-gray-400 ml-2">v1.4 • 9宫格方案版</span></h2>
+             <h2 className="text-lg font-bold tracking-wide">分镜头绘画师 <span className="text-xs font-normal text-gray-400 ml-2">v1.5 • 数据库增强版</span></h2>
            </div>
            
-           {/* Monitor in Header */}
            <div className="flex items-center gap-4">
               <QuotaMonitor requestTimestamps={requestTimestamps} lastUsage={lastUsage} />
               <div className="h-6 w-px bg-gray-700"></div>
@@ -292,26 +385,8 @@ const App: React.FC = () => {
             <ControlPanel 
                 shot={currentShot} 
                 onUpdateShot={updateCurrentShot} 
-                onPolish={async () => {
-                    setIsProcessing(true);
-                    try { 
-                        const { text: polished, usage } = await polishScript(currentShot.script); 
-                        recordUsage(usage);
-                        updateCurrentShot({ enhancedScript: polished }); 
-                    }
-                    catch(e) { handleError(e, "脚本润色"); }
-                    finally { setIsProcessing(false); }
-                }} 
-                onGeneratePrompt={async () => {
-                    setIsProcessing(true);
-                    try { 
-                        const { en, cn, usage } = await generatePrompts(currentShot.enhancedScript); 
-                        recordUsage(usage);
-                        updateCurrentShot({ aiPromptEn: en, aiPromptCn: cn }); 
-                    }
-                    catch(e) { handleError(e, "提示词生成"); }
-                    finally { setIsProcessing(false); }
-                }} 
+                onPolish={handlePolishScript} 
+                onGeneratePrompt={handleGeneratePrompts} 
                 onTranslate={handleTranslatePrompt}
                 isProcessing={isProcessing} 
             />
@@ -330,8 +405,8 @@ const App: React.FC = () => {
           </div>
         </main>
       </div>
+
+      {showGallery && <GalleryModal shots={shots} onClose={() => setShowGallery(false)} />}
     </div>
   );
-};
-
-export default App;
+}

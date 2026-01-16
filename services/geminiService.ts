@@ -10,7 +10,24 @@ const getAiClient = () => {
   return new GoogleGenAI({ apiKey });
 };
 
-// Retry helper with exponential backoff and jitter
+// Retry helper (Simpler version for streams to avoid complexity)
+const retryStreamConnection = async <T>(
+  operation: () => Promise<T>, 
+  maxRetries = 3
+): Promise<T> => {
+  let lastError: any;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (error: any) {
+      lastError = error;
+      if (i < maxRetries - 1) await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+  throw lastError;
+};
+
+// Retry helper for non-streaming operations
 const retryOperation = async <T>(
   operation: () => Promise<T>, 
   maxRetries = 5, 
@@ -23,95 +40,21 @@ const retryOperation = async <T>(
     } catch (error: any) {
       lastError = error;
       
-      // Analyze error structure
       const errBody = error?.error || error; 
       const code = errBody?.code || error?.status;
       const message = errBody?.message || error?.message || "";
-      const status = errBody?.status;
-      const errStr = JSON.stringify(error);
-
-      const isRateLimit = 
-        code === 429 || 
-        status === "RESOURCE_EXHAUSTED" ||
-        (message && (
-          message.includes('429') || 
-          message.includes('RESOURCE_EXHAUSTED') ||
-          message.includes('quota') ||
-          message.includes('exceeded')
-        )) ||
-        errStr.includes('RESOURCE_EXHAUSTED') ||
-        errStr.includes('429');
+      const isRateLimit = code === 429 || (message && message.includes('429'));
       
-      const isServerOverload = code === 503 || (message && message.includes('503'));
-
-      if ((isRateLimit || isServerOverload) && i < maxRetries - 1) {
-        // Exponential backoff + Random jitter (0-1000ms)
-        const jitter = Math.floor(Math.random() * 1000);
-        const delay = initialDelay * Math.pow(2, i) + jitter;
-        
-        console.warn(`[Gemini Service] Rate limit/Overload hit (${code || status}). Retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
-        
+      if (isRateLimit && i < maxRetries - 1) {
+        const delay = initialDelay * Math.pow(2, i);
+        console.warn(`Rate limit hit. Retrying in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
-      
-      // If we are throwing the error (final attempt or non-retriable),
-      // ensure it's a standard Error object with a clear message.
-      if (i === maxRetries - 1 || (!isRateLimit && !isServerOverload)) {
-          // Check if it's the specific raw JSON structure and normalize it
-          if (errBody && errBody.code && errBody.message) {
-              const normalizedMessage = `[${errBody.code}] ${errBody.status || 'Error'}: ${errBody.message}`;
-              const newError = new Error(normalizedMessage);
-              (newError as any).originalError = error;
-              throw newError;
-          }
-      }
-
       throw error;
     }
   }
   throw lastError;
-};
-
-// 辅助函数：本地裁剪图片
-const cropImage = (base64: string, index: number): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => {
-      try {
-        const cols = 3;
-        const rows = 3;
-        const cellWidth = img.width / cols;
-        const cellHeight = img.height / rows;
-        const i = index - 1;
-        const col = i % cols;
-        const row = Math.floor(i / cols);
-        
-        const canvas = document.createElement('canvas');
-        canvas.width = cellWidth;
-        canvas.height = cellHeight;
-        const ctx = canvas.getContext('2d');
-        
-        if (!ctx) {
-           reject(new Error("Could not get canvas context"));
-           return;
-        }
-        
-        ctx.drawImage(
-          img, 
-          col * cellWidth, row * cellHeight, cellWidth, cellHeight, 
-          0, 0, cellWidth, cellHeight 
-        );
-        
-        resolve(canvas.toDataURL('image/png'));
-      } catch (err) {
-        reject(err);
-      }
-    };
-    img.onerror = (e) => reject(new Error("Failed to load image for cropping"));
-    img.src = base64;
-  });
 };
 
 const emptyUsage: UsageMetadata = { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 };
@@ -144,7 +87,6 @@ const handleImageResponse = (response: any): { base64: string, usage: UsageMetad
       }
     }
     if (textContent) {
-        console.warn("AI returned text:", textContent);
         throw new Error(`AI refused to generate image: ${textContent.slice(0, 50)}...`);
     }
   }
@@ -152,7 +94,11 @@ const handleImageResponse = (response: any): { base64: string, usage: UsageMetad
   throw new Error("No image data found in response");
 };
 
-export const polishScript = async (script: string): Promise<{ text: string, usage: UsageMetadata }> => {
+// STREAMING: Polish Script
+export const polishScriptStream = async (
+    script: string, 
+    onUpdate: (text: string) => void
+): Promise<UsageMetadata> => {
   const ai = getAiClient();
   const prompt = `
     你是一位专业的电影分镜脚本师。请将以下简略的分镜描述扩写为一段画面感极强、包含环境细节、光影氛围和人物情绪的专业分镜描述。
@@ -166,67 +112,90 @@ export const polishScript = async (script: string): Promise<{ text: string, usag
   `;
 
   try {
-    const response: GenerateContentResponse = await retryOperation(() => ai.models.generateContent({
+    const response = await retryStreamConnection(() => ai.models.generateContentStream({
       model: 'gemini-3-flash-preview',
       contents: prompt,
     }));
-    return {
-      text: response.text || "",
-      usage: response.usageMetadata || emptyUsage
-    };
+
+    let fullText = "";
+    let finalUsage = emptyUsage;
+
+    for await (const chunk of (response as any)) {
+      const text = chunk.text;
+      if (text) {
+        fullText += text;
+        onUpdate(fullText); // Push accumulated text
+      }
+      if (chunk.usageMetadata) {
+          finalUsage = chunk.usageMetadata;
+      }
+    }
+    return finalUsage;
   } catch (error) {
     console.error("Error polishing script:", error);
     throw error;
   }
 };
 
-export const generatePrompts = async (enhancedScript: string): Promise<{ en: string, cn: string, usage: UsageMetadata }> => {
+// STREAMING: Generate Prompts (Updated for Speed)
+// We now use a custom separator '|||' to stream both English and Chinese parts in one go.
+export const generatePromptsStream = async (
+    enhancedScript: string,
+    onUpdate: (en: string, cn: string) => void
+): Promise<UsageMetadata> => {
   const ai = getAiClient();
   const prompt = `
     Based on the following storyboard description, generate a high-quality AI image generation prompt (Stable Diffusion/Midjourney style) in English, and provide a direct Simplified Chinese translation of the prompt.
 
     Description: ${enhancedScript}
 
-    Return JSON format:
-    {
-      "en_prompt": "string",
-      "cn_explanation": "string"
-    }
+    FORMAT REQUIREMENTS:
+    1. Output the English Prompt first.
+    2. Then output the separator string: "|||"
+    3. Then output the Chinese Translation.
+    4. Do not output any other text or JSON.
+
+    Example Output:
+    Cinematic shot of a hero standing in rain... ||| 电影感镜头，英雄伫立在雨中...
   `;
 
   try {
-    const response: GenerateContentResponse = await retryOperation(() => ai.models.generateContent({
+    const response = await retryStreamConnection(() => ai.models.generateContentStream({
       model: 'gemini-3-flash-preview',
       contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            en_prompt: { type: Type.STRING },
-            cn_explanation: { type: Type.STRING },
-          },
-          required: ["en_prompt", "cn_explanation"]
-        }
-      }
     }));
 
-    const jsonText = response.text;
-    if (!jsonText) throw new Error("No response from AI");
-    
-    const result = JSON.parse(jsonText);
-    return {
-      en: result.en_prompt,
-      cn: result.cn_explanation,
-      usage: response.usageMetadata || emptyUsage
-    };
+    let fullText = "";
+    let finalUsage = emptyUsage;
+
+    for await (const chunk of (response as any)) {
+      const text = chunk.text;
+      if (text) {
+        fullText += text;
+        
+        // Simple stream parsing
+        const parts = fullText.split('|||');
+        const en = parts[0].trim();
+        const cn = parts.length > 1 ? parts[1].trim() : "";
+        
+        onUpdate(en, cn);
+      }
+      if (chunk.usageMetadata) {
+          finalUsage = chunk.usageMetadata;
+      }
+    }
+    return finalUsage;
   } catch (error) {
-    console.error("Error generating prompts:", error);
+    console.error("Error generating prompts stream:", error);
     throw error;
   }
 };
 
-export const translateText = async (text: string): Promise<{ text: string, usage: UsageMetadata }> => {
+// STREAMING: Translate
+export const translateTextStream = async (
+    text: string,
+    onUpdate: (text: string) => void
+): Promise<UsageMetadata> => {
   const ai = getAiClient();
   const prompt = `Translate the following English AI image prompt into Simplified Chinese. Just provide the direct translation.
   
@@ -234,14 +203,23 @@ export const translateText = async (text: string): Promise<{ text: string, usage
   Chinese:`;
 
   try {
-    const response: GenerateContentResponse = await retryOperation(() => ai.models.generateContent({
+    const response = await retryStreamConnection(() => ai.models.generateContentStream({
       model: 'gemini-3-flash-preview',
       contents: prompt,
     }));
-    return {
-      text: response.text?.trim() || "",
-      usage: response.usageMetadata || emptyUsage
-    };
+
+    let fullText = "";
+    let finalUsage = emptyUsage;
+
+    for await (const chunk of (response as any)) {
+        const t = chunk.text;
+        if (t) {
+            fullText += t;
+            onUpdate(fullText);
+        }
+        if (chunk.usageMetadata) finalUsage = chunk.usageMetadata;
+    }
+    return finalUsage;
   } catch (error) {
     console.error("Error translating text:", error);
     throw error;
@@ -307,6 +285,47 @@ export const generateImage = async (
   }
 };
 
+// ... keep existing cropImage and extractGridPanel helpers ...
+const cropImage = (base64: string, index: number): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        try {
+          const cols = 3;
+          const rows = 3;
+          const cellWidth = img.width / cols;
+          const cellHeight = img.height / rows;
+          const i = index - 1;
+          const col = i % cols;
+          const row = Math.floor(i / cols);
+          
+          const canvas = document.createElement('canvas');
+          canvas.width = cellWidth;
+          canvas.height = cellHeight;
+          const ctx = canvas.getContext('2d');
+          
+          if (!ctx) {
+             reject(new Error("Could not get canvas context"));
+             return;
+          }
+          
+          ctx.drawImage(
+            img, 
+            col * cellWidth, row * cellHeight, cellWidth, cellHeight, 
+            0, 0, cellWidth, cellHeight 
+          );
+          
+          resolve(canvas.toDataURL('image/png'));
+        } catch (err) {
+          reject(err);
+        }
+      };
+      img.onerror = (e) => reject(new Error("Failed to load image for cropping"));
+      img.src = base64;
+    });
+  };
+  
 export const extractGridPanel = async (
   gridImageBase64: string,
   panelIndex: number,

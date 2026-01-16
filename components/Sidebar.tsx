@@ -1,6 +1,7 @@
+
 import React from 'react';
 import { Shot } from '../types';
-import { Plus, Trash2, Image as ImageIcon, Download } from 'lucide-react';
+import { Plus, Trash2, Image as ImageIcon, Download, LayoutGrid } from 'lucide-react';
 
 interface SidebarProps {
   shots: Shot[];
@@ -9,6 +10,7 @@ interface SidebarProps {
   onAddShot: () => void;
   onDeleteShot: (id: string) => void;
   onDownloadAll: () => void;
+  onOpenGallery: () => void; // New prop
 }
 
 const Sidebar: React.FC<SidebarProps> = ({
@@ -17,19 +19,29 @@ const Sidebar: React.FC<SidebarProps> = ({
   onSelectShot,
   onAddShot,
   onDeleteShot,
-  onDownloadAll
+  onDownloadAll,
+  onOpenGallery
 }) => {
   return (
     <div className="w-64 bg-gray-800 border-r border-gray-700 flex flex-col h-full">
       <div className="p-4 border-b border-gray-700 flex justify-between items-center">
         <h1 className="font-bold text-lg text-white">镜头列表</h1>
-        <button 
-          onClick={onDownloadAll}
-          title="打包下载所有镜头"
-          className="p-2 text-gray-400 hover:text-white transition-colors"
-        >
-          <Download size={18} />
-        </button>
+        <div className="flex gap-1">
+             <button 
+              onClick={onOpenGallery}
+              title="打开本地图库 (所有历史图片)"
+              className="p-2 text-indigo-400 hover:text-white hover:bg-indigo-600 rounded-md transition-all"
+            >
+              <LayoutGrid size={18} />
+            </button>
+            <button 
+              onClick={onDownloadAll}
+              title="打包下载所有镜头"
+              className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded-md transition-all"
+            >
+              <Download size={18} />
+            </button>
+        </div>
       </div>
       
       <div className="flex-1 overflow-y-auto p-2 space-y-2">
